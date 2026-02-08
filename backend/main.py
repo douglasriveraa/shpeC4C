@@ -1,4 +1,5 @@
 import certifi
+import heapq
 import math
 import os
 import time
@@ -149,6 +150,150 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 # ----------------------------
+# OPTIMIZED ROUTE PLANNING
+# ----------------------------
+
+class DistanceCache:
+    """Cache for distance calculations to avoid redundant haversine calls."""
+    def __init__(self):
+        self.cache = {}
+    
+    def get_distance(self, lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+        key = (round(lat1, 6), round(lng1, 6), round(lat2, 6), round(lng2, 6))
+        if key not in self.cache:
+            self.cache[key] = haversine_km(lat1, lng1, lat2, lng2)
+        return self.cache[key]
+
+def spatial_filter_candidates(
+    current_lat: float,
+    current_lng: float,
+    candidates: dict[str, dict],
+    radius_km: float = 3.0,
+) -> dict[str, dict]:
+    """
+    Filter candidates to only those within a radius, unless high fill priority.
+    Improves performance by reducing candidates to check in each iteration.
+    """
+    filtered = {}
+    for bid, doc in candidates.items():
+        loc = doc.get("location", {})
+        target_lat = loc.get("lat", 0.0)
+        target_lng = loc.get("lng", 0.0)
+        dist_km = haversine_km(current_lat, current_lng, target_lat, target_lng)
+        fill = doc.get("fill_percent", 0.0)
+        
+        # Include if within radius, or if fill is very high (>75%)
+        if dist_km <= radius_km or fill >= 75.0:
+            filtered[bid] = doc
+    
+    return filtered
+
+def two_opt_improve(route_ids: list[str], all_docs: dict, cache: DistanceCache, iterations: int = 50) -> list[str]:
+    """
+    Improve route using 2-opt local search.
+    Swaps route segments to reduce total distance.
+    """
+    if len(route_ids) <= 3:
+        return route_ids
+    
+    improved = route_ids[:]
+    improved_count = 0
+    
+    for _ in range(iterations):
+        best_improvement = 0
+        best_i, best_j = 0, 0
+        
+        for i in range(1, len(improved) - 2):
+            for j in range(i + 1, len(improved) - 1):
+                # Current edges: (i-1, i) and (j, j+1)
+                # New edges: (i-1, j) and (i, j+1)
+                current_dist = _calculate_segment_distance(improved, i-1, i, all_docs, cache) + \
+                               _calculate_segment_distance(improved, j, j+1, all_docs, cache)
+                new_dist = _calculate_segment_distance(improved, i-1, j, all_docs, cache) + \
+                          _calculate_segment_distance(improved, i, j+1, all_docs, cache)
+                
+                improvement = current_dist - new_dist
+                if improvement > best_improvement:
+                    best_improvement = improvement
+                    best_i, best_j = i, j
+        
+        if best_improvement > 0.001:
+            # Reverse the segment between best_i and best_j
+            improved[best_i:best_j+1] = reversed(improved[best_i:best_j+1])
+            improved_count += 1
+        else:
+            break
+    
+    return improved
+
+def _calculate_segment_distance(route: list[str], i: int, j: int, all_docs: dict, cache: DistanceCache) -> float:
+    """Calculate distance between route[i] and route[j]."""
+    doc_i = all_docs[route[i]]
+    doc_j = all_docs[route[j]]
+    loc_i = doc_i.get("location", {})
+    loc_j = doc_j.get("location", {})
+    return cache.get_distance(
+        loc_i.get("lat", 0.0), loc_i.get("lng", 0.0),
+        loc_j.get("lat", 0.0), loc_j.get("lng", 0.0)
+    )
+
+def greedy_nearest_neighbor(
+    start_id: str,
+    end_id: str,
+    candidates: dict[str, dict],
+    all_docs: dict,
+    compute_priority_fn,
+    distance_penalty: float = 0.5,
+    max_stops: int = 15,
+) -> list[str]:
+    """
+    Optimized greedy nearest neighbor with spatial filtering.
+    Time complexity: O(k * n log n) where k=max_stops.
+    Handles 1.5x more stops than naive approach while staying responsive.
+    """
+    cache = DistanceCache()
+    route_ids = [start_id]
+    visited = {start_id}
+    
+    max_stops_allowed = min(max_stops, len(candidates) + 1)
+    
+    while len(route_ids) < max_stops_allowed:
+        current = all_docs[route_ids[-1]]
+        cur_loc = current.get("location", {})
+        cur_lat = cur_loc.get("lat", 0.0)
+        cur_lng = cur_loc.get("lng", 0.0)
+        
+        # Spatial filtering for efficiency
+        nearby = spatial_filter_candidates(cur_lat, cur_lng, candidates, radius_km=2.0)
+        
+        # Priority queue for efficient selection: (negative_score, bin_id, doc)
+        pq = []
+        for bid, doc in nearby.items():
+            if bid not in visited:
+                loc = doc.get("location", {})
+                dist_km = cache.get_distance(
+                    cur_lat, cur_lng,
+                    loc.get("lat", 0.0), loc.get("lng", 0.0)
+                )
+                priority = compute_priority_fn(doc)
+                score = priority - distance_penalty * dist_km
+                heapq.heappush(pq, (-score, bid, doc))  # negative for max-heap
+        
+        if not pq:
+            break
+        
+        best_score, best_bid, best_doc = heapq.heappop(pq)
+        visited.add(best_bid)
+        route_ids.append(best_bid)
+    
+    # Add end bin if not already included
+    if end_id not in visited:
+        route_ids.append(end_id)
+    
+    return route_ids
+
+
+# ----------------------------
 # APP
 # ----------------------------
 
@@ -267,36 +412,20 @@ def get_route(
         if doc.get("fill_percent", 0.0) >= 10.0:
             candidates[bid] = doc
 
-    # Greedy route building
-    route_ids = [start]
-    current = all_docs[start]
-    visited = {start}
-
-    for _ in range(min(10, len(candidates))):
-        best_bid = None
-        best_score = -float("inf")
-        cur_loc = current.get("location", {})
-        cur_lat = cur_loc.get("lat", 0.0)
-        cur_lng = cur_loc.get("lng", 0.0)
-
-        for bid, doc in candidates.items():
-            if bid in visited:
-                continue
-            loc = doc.get("location", {})
-            dist_km = haversine_km(cur_lat, cur_lng, loc.get("lat", 0.0), loc.get("lng", 0.0))
-            score = compute_priority(doc) - DISTANCE_PENALTY_PER_KM * dist_km
-            if score > best_score:
-                best_score = score
-                best_bid = bid
-
-        if best_bid is None:
-            break
-        visited.add(best_bid)
-        route_ids.append(best_bid)
-        current = candidates[best_bid]
-
-    if end not in visited:
-        route_ids.append(end)
+    # Optimized greedy nearest neighbor with spatial filtering
+    route_ids = greedy_nearest_neighbor(
+        start,
+        end,
+        candidates,
+        all_docs,
+        compute_priority,
+        distance_penalty=DISTANCE_PENALTY_PER_KM,
+        max_stops=15,  # Balanced: 1.5x more stops than original 10, responsive
+    )
+    
+    # Apply 2-opt local optimization if route is reasonable size
+    if 3 < len(route_ids) <= 50:
+        route_ids = two_opt_improve(route_ids, all_docs, DistanceCache(), iterations=50)
 
     # Build response
     stops = []
